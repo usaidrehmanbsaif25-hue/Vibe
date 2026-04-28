@@ -1,0 +1,4 @@
+﻿# Ignore uploads / generated media
+snapsync-video-builder/uploads/
+*.zip
+*.wav
