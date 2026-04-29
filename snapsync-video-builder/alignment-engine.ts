@@ -132,8 +132,11 @@ function findSentenceMatch(
  */
 function parseCsvField(raw: string): string {
   const s = raw.trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+  if (s.startsWith('"') && s.endsWith('"')) {
     return s.slice(1, -1).replace(/""/g, '"').trim();
+  }
+  if (s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'").trim();
   }
   return s;
 }
@@ -152,8 +155,8 @@ function splitCsvLine(line: string): [string, string | undefined] {
       inQuote = true;
       quoteChar = ch;
     } else if (inQuote && ch === quoteChar) {
-      // Handle escaped double-quote ("") – stay inside the field
-      if (line[i + 1] === quoteChar) { i++; continue; }
+      // Handle escaped double-quote ("") or single-quote ('') – stay inside the field
+      if (i + 1 < line.length && line[i + 1] === quoteChar) { i++; continue; }
       inQuote = false;
     } else if (!inQuote && ch === ',') {
       // Found the field separator
