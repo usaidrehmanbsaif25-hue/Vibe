@@ -477,7 +477,7 @@ export default function App() {
       
       <footer className="mt-12 text-center">
         <p className="text-[10px] font-mono uppercase opacity-30 tracking-[0.2em]">
-          Powered by Groq Whisper & Llama 3.3 • v3.0.0 PRO + CapCut
+          Powered by Gladia • v3.0.0 PRO + CapCut
         </p>
       </footer>
     </div>
