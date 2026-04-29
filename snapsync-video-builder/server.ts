@@ -10,7 +10,7 @@ import AdmZip from 'adm-zip';
 import { parse } from 'csv-parse/sync';
 import dotenv from 'dotenv';
 import { generateCapCutProject, AlignmentEntry } from './capcut-generator.js';
-import { transcribeWithGroq, extractWords, parseCsvText, alignCsvToAudio } from './alignment-engine.js';
+import { transcribeWithGladia, extractWords, parseCsvText, alignCsvToAudio } from './alignment-engine.js';
 
 dotenv.config({ path: '.env.local' });
 
@@ -58,7 +58,17 @@ const tasks: Record<string, {
   message: string;
   videoUrl?: string;
   error?: string;
-}> = {};
+}> = Object.create(null); // null-prototype prevents __proto__ pollution
+
+/** Validate that a taskId is a well-formed UUID (v4 hex string from uuidv4()). */
+function isValidTaskId(id: unknown): id is string {
+  return typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
+/** Safely look up a task, guarded against prototype-pollution keys. */
+function getTask(id: string) {
+  return Object.hasOwn(tasks, id) ? tasks[id] : undefined;
+}
 
 // 1. Upload files
 app.post('/api/upload', (req: express.Request, res: express.Response) => {
@@ -100,11 +110,11 @@ app.post('/api/upload', (req: express.Request, res: express.Response) => {
 app.post('/api/build', async (req, res) => {
   const { taskId, alignment, settings } = req.body;
   
-  if (!taskId || !alignment || !Array.isArray(alignment)) {
+  if (!isValidTaskId(taskId) || !alignment || !Array.isArray(alignment)) {
     return res.status(400).json({ error: 'Invalid task or alignment data' });
   }
 
-  const task = tasks[taskId];
+  const task = getTask(taskId);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
   task.status = 'processing';
@@ -270,22 +280,23 @@ app.post('/api/build', async (req, res) => {
 });
 
 app.get('/api/status/:taskId', (req, res) => {
-  const task = tasks[req.params.taskId];
+  if (!isValidTaskId(req.params.taskId)) return res.status(400).json({ error: 'Invalid taskId' });
+  const task = getTask(req.params.taskId);
   if (!task) return res.status(404).json({ error: 'Task not found' });
   res.json(task);
 });
 
-// ── Server-side Alignment (word-level Whisper + fuzzy matching) ───
+// ── Server-side Alignment (word-level Gladia + fuzzy matching) ───
 app.post('/api/align', async (req, res) => {
   const { taskId } = req.body;
-  if (!taskId) return res.status(400).json({ error: 'taskId required' });
+  if (!isValidTaskId(taskId)) return res.status(400).json({ error: 'taskId required' });
 
-  const task = tasks[taskId];
+  const task = getTask(taskId);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
   task.status = 'processing';
   task.progress = 10;
-  task.message = 'Transcribing audio with Whisper...';
+  task.message = 'Transcribing audio with Gladia...';
 
   try {
     const taskDir = path.join(UPLOADS_DIR, taskId);
@@ -306,12 +317,12 @@ app.post('/api/align', async (req, res) => {
     });
 
     task.progress = 20;
-    task.message = 'Getting word-level timestamps from Whisper...';
+    task.message = 'Getting word-level timestamps from Gladia...';
 
-    // Transcribe with word-level timestamps
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) throw new Error('GROQ_API_KEY not configured');
-    const whisperResult = await transcribeWithGroq(audioPath, apiKey);
+    // Transcribe with word-level timestamps via Gladia
+    const apiKey = process.env.GLADIA_API_KEY;
+    if (!apiKey) throw new Error('GLADIA_API_KEY not configured');
+    const whisperResult = await transcribeWithGladia(audioPath, apiKey);
 
     task.progress = 60;
     task.message = 'Aligning script lines to audio...';
@@ -346,11 +357,11 @@ app.post('/api/align', async (req, res) => {
 app.post('/api/build-capcut', async (req, res) => {
   const { taskId, alignment, settings } = req.body;
 
-  if (!taskId || !alignment || !Array.isArray(alignment)) {
+  if (!isValidTaskId(taskId) || !alignment || !Array.isArray(alignment)) {
     return res.status(400).json({ error: 'Invalid task or alignment data' });
   }
 
-  const task = tasks[taskId];
+  const task = getTask(taskId);
   if (!task) return res.status(404).json({ error: 'Task not found' });
 
   task.status = 'processing';

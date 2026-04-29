@@ -507,3 +507,138 @@ export async function transcribeWithGroq(
     }
   }
 }
+
+// ── Gladia transcription ──────────────────────────────────────────────
+
+const GLADIA_UPLOAD_URL     = 'https://api.gladia.io/v2/upload';
+const GLADIA_TRANSCRIBE_URL = 'https://api.gladia.io/v2/pre-recorded';
+const GLADIA_POLL_INTERVAL  = 3000;  // ms between status polls
+const GLADIA_MAX_WAIT_MS    = 20 * 60 * 1000; // 20-minute cap
+
+/**
+ * Transcribe an audio file using Gladia's async API.
+ * Handles audio of any length — Gladia processes the whole file server-side.
+ * Returns a Whisper-compatible response `{ words: [{word, start, end}] }` so
+ * the existing `extractWords` / `alignCsvToAudio` pipeline works unchanged.
+ */
+export async function transcribeWithGladia(
+  audioFilePath: string,
+  apiKey: string,
+  onProgress?: (msg: string) => void
+): Promise<any> {
+  const { default: fsFull } = await import('fs');
+  const pathMod  = await import('path');
+  const osMod    = await import('os');
+  const FormData = (await import('form-data')).default;
+  const fetch    = (await import('node-fetch')).default;
+
+  const log = (msg: string) => { console.log(msg); onProgress?.(msg); };
+
+  const tmpDir   = osMod.tmpdir();
+  const tempFiles: string[] = [];
+
+  try {
+    // ── Step 1: Compress to mono MP3 for faster upload ───────────────
+    const compressedPath = pathMod.join(tmpDir, `snapsync_gladia_${Date.now()}.mp3`);
+    tempFiles.push(compressedPath);
+
+    const origSize = fsFull.statSync(audioFilePath).size;
+    log(`[gladia] Compressing audio (${(origSize / 1024 / 1024).toFixed(1)}MB) → mono 64kbps MP3...`);
+    await compressAudio(audioFilePath, compressedPath);
+    const compressedSize = fsFull.statSync(compressedPath).size;
+    log(`[gladia] Compressed to ${(compressedSize / 1024 / 1024).toFixed(1)}MB`);
+
+    // ── Step 2: Upload to Gladia ─────────────────────────────────────
+    log(`[gladia] Uploading audio to Gladia...`);
+    const uploadForm = new FormData();
+    uploadForm.append('audio', fsFull.createReadStream(compressedPath), {
+      filename: 'audio.mp3',
+      contentType: 'audio/mpeg'
+    });
+
+    const uploadRes = await fetch(GLADIA_UPLOAD_URL, {
+      method: 'POST',
+      headers: { 'x-gladia-key': apiKey, ...uploadForm.getHeaders() },
+      body: uploadForm
+    });
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      throw new Error(`Gladia upload failed (${uploadRes.status}): ${errText}`);
+    }
+    const uploadData: any = await uploadRes.json();
+    const audioUrl: string = uploadData.audio_url;
+    if (!audioUrl) throw new Error('Gladia upload did not return audio_url');
+    log(`[gladia] Upload complete. audio_url: ${audioUrl}`);
+
+    // ── Step 3: Start transcription job ─────────────────────────────
+    log(`[gladia] Starting transcription job...`);
+    const transcribeRes = await fetch(GLADIA_TRANSCRIBE_URL, {
+      method: 'POST',
+      headers: {
+        'x-gladia-key': apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        audio_url: audioUrl,
+        diarization: false,
+        word_timestamps: true
+      })
+    });
+    if (!transcribeRes.ok) {
+      const errText = await transcribeRes.text();
+      throw new Error(`Gladia transcription start failed (${transcribeRes.status}): ${errText}`);
+    }
+    const transcribeData: any = await transcribeRes.json();
+    const jobId: string = transcribeData.id;
+    if (!jobId) throw new Error('Gladia did not return a job id');
+    log(`[gladia] Job created: ${jobId}`);
+
+    // ── Step 4: Poll for completion ──────────────────────────────────
+    const pollUrl = `${GLADIA_TRANSCRIBE_URL}/${jobId}`;
+    const deadline = Date.now() + GLADIA_MAX_WAIT_MS;
+    let gladiaResult: any = null;
+
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, GLADIA_POLL_INTERVAL));
+      const pollRes = await fetch(pollUrl, {
+        headers: { 'x-gladia-key': apiKey }
+      });
+      if (!pollRes.ok) {
+        const errText = await pollRes.text();
+        throw new Error(`Gladia poll failed (${pollRes.status}): ${errText}`);
+      }
+      const pollData: any = await pollRes.json();
+      log(`[gladia] Job status: ${pollData.status}`);
+
+      if (pollData.status === 'done') {
+        gladiaResult = pollData;
+        break;
+      }
+      if (pollData.status === 'error') {
+        throw new Error(`Gladia transcription error: ${JSON.stringify(pollData.error_code ?? pollData)}`);
+      }
+    }
+
+    if (!gladiaResult) {
+      throw new Error(`Gladia transcription timed out after ${GLADIA_MAX_WAIT_MS / 60000} minutes`);
+    }
+
+    // ── Step 5: Convert to Whisper-compatible word list ───────────────
+    const utterances: any[] = gladiaResult?.result?.transcription?.utterances ?? [];
+    const words: { word: string; start: number; end: number }[] = [];
+
+    for (const utt of utterances) {
+      for (const w of (utt.words ?? [])) {
+        if (w.word) words.push({ word: w.word, start: w.start ?? 0, end: w.end ?? 0 });
+      }
+    }
+    log(`[gladia] Extracted ${words.length} words from transcript`);
+
+    return { words, segments: [] };
+
+  } finally {
+    for (const f of tempFiles) {
+      try { if (fsFull.existsSync(f)) fsFull.unlinkSync(f); } catch {}
+    }
+  }
+}
