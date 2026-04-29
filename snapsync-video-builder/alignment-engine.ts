@@ -15,15 +15,17 @@ export interface WhisperWord {
 
 export interface CsvRow {
   index: number;
-  text: string;       // original text
-  cleanText: string;  // normalized
-  tokens: string[];   // normalized tokens
+  text: string;           // original text
+  cleanText: string;      // normalized
+  tokens: string[];       // normalized tokens
+  imageFileName?: string; // optional second CSV column (image filename)
 }
 
 export interface AlignedSegment {
   text: string;
   startTime: number;
   endTime: number;
+  imageFileName?: string; // forwarded from CSV second column
 }
 
 // ── Text normalization (matches notebook logic) ──────────────────────
@@ -75,7 +77,7 @@ function findSentenceMatch(
   sentenceTokens: string[],
   words: WhisperWord[],
   startWordIndex: number,
-  lookaheadWords: number = 600
+  lookaheadWords: number = 1000
 ): { startIdx: number; endIdx: number; score: number } | null {
   if (!sentenceTokens.length) return null;
 
@@ -125,15 +127,56 @@ function findSentenceMatch(
 
 // ── Parse CSV text into rows ─────────────────────────────────────────
 
+/**
+ * Parse a single CSV value: strip surrounding quotes and unescape doubled quotes.
+ */
+function parseCsvField(raw: string): string {
+  const s = raw.trim();
+  if (s.startsWith('"') && s.endsWith('"')) {
+    return s.slice(1, -1).replace(/""/g, '"').trim();
+  }
+  if (s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'").trim();
+  }
+  return s;
+}
+
+/**
+ * Split a CSV line into at most two fields, respecting quoted values.
+ * Returns [textField, imageField | undefined].
+ */
+function splitCsvLine(line: string): [string, string | undefined] {
+  // Walk through the line tracking whether we are inside a quoted field
+  let inQuote = false;
+  let quoteChar = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (!inQuote && (ch === '"' || ch === "'")) {
+      inQuote = true;
+      quoteChar = ch;
+    } else if (inQuote && ch === quoteChar) {
+      // Handle escaped double-quote ("") or single-quote ('') – stay inside the field
+      if (i + 1 < line.length && line[i + 1] === quoteChar) { i++; continue; }
+      inQuote = false;
+    } else if (!inQuote && ch === ',') {
+      // Found the field separator
+      const textRaw  = line.substring(0, i);
+      const imageRaw = line.substring(i + 1);
+      const imageVal = parseCsvField(imageRaw);
+      return [parseCsvField(textRaw), imageVal || undefined];
+    }
+  }
+  // No comma found – single-column CSV
+  return [parseCsvField(line), undefined];
+}
+
 export function parseCsvText(csvText: string): CsvRow[] {
   const lines = csvText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const rows: CsvRow[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    let text = lines[i];
-    const commaIdx = text.indexOf(',');
-    if (commaIdx >= 0) text = text.substring(0, commaIdx);
-    text = text.replace(/^["']|["']$/g, '').trim();
+    const [textRaw, imageFileName] = splitCsvLine(lines[i]);
+    const text = textRaw.trim();
 
     const lower = text.toLowerCase();
     if (i === 0 && (lower === 'text' || lower === 'script' || lower === 'line' ||
@@ -144,7 +187,7 @@ export function parseCsvText(csvText: string): CsvRow[] {
     const clean = normalizeText(text);
     if (!clean) continue;
 
-    rows.push({ index: rows.length, text, cleanText: clean, tokens: clean.split(' ') });
+    rows.push({ index: rows.length, text, cleanText: clean, tokens: clean.split(' '), imageFileName });
   }
   return rows;
 }
@@ -266,7 +309,8 @@ export function alignCsvToAudio(
     result.push({
       text: csvRows[i].text,
       startTime: Math.round(t[0] * 1000) / 1000,
-      endTime:   Math.round(endTime * 1000) / 1000
+      endTime:   Math.round(endTime * 1000) / 1000,
+      imageFileName: csvRows[i].imageFileName
     });
   }
 
@@ -275,11 +319,7 @@ export function alignCsvToAudio(
 
 // ── Transcription helpers ─────────────────────────────────────────────
 
-const GROQ_MAX_BYTES     = 24 * 1024 * 1024; // 24MB (Groq hard limit is 25MB)
-const CHUNK_DURATION_SEC = 8 * 60;            // 8-minute chunks per Whisper request
-const CHUNK_OVERLAP_SEC  = 10;                // 10s overlap so boundary words aren't missed
-
-/** Compress audio to mono 64kbps 16kHz MP3 — ideal for Whisper, tiny file size */
+/** Compress audio to mono 64kbps 16kHz MP3 — smaller upload, no quality loss for speech */
 async function compressAudio(inputPath: string, outputPath: string): Promise<void> {
   const ffmpegMod       = (await import('fluent-ffmpeg')).default;
   const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
@@ -312,65 +352,29 @@ async function getAudioDuration(filePath: string): Promise<number> {
   });
 }
 
-/** Extract a time slice of audio [startSec, endSec) into outputPath */
-async function sliceAudio(inputPath: string, startSec: number, durationSec: number, outputPath: string): Promise<void> {
-  const ffmpegMod       = (await import('fluent-ffmpeg')).default;
-  const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
-  ffmpegMod.setFfmpegPath(ffmpegInstaller.path);
+// ── Gladia transcription ──────────────────────────────────────────────
 
-  return new Promise((resolve, reject) => {
-    ffmpegMod(inputPath)
-      .setStartTime(startSec)
-      .setDuration(durationSec)
-      .outputOptions(['-y'])
-      .on('end', () => resolve())
-      .on('error', (err: Error) => reject(new Error(`FFmpeg slice failed: ${err.message}`)))
-      .save(outputPath);
-  });
-}
+const GLADIA_UPLOAD_URL     = 'https://api.gladia.io/v2/upload';
+const GLADIA_TRANSCRIBE_URL = 'https://api.gladia.io/v2/pre-recorded';
+const GLADIA_POLL_INTERVAL  = 3000;  // ms between status polls
+const GLADIA_MAX_WAIT_MS    = 20 * 60 * 1000; // 20-minute cap
 
-/** Upload one audio buffer to Groq Whisper, return response JSON */
-async function whisperRequest(audioBuffer: Buffer, fileName: string, apiKey: string): Promise<any> {
-  const FormData = (await import('form-data')).default;
-  const fetch    = (await import('node-fetch')).default;
-
-  const ext = fileName.split('.').pop()?.toLowerCase() || 'mp3';
-  const mimeMap: Record<string, string> = {
-    mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4',
-    aac: 'audio/aac', ogg: 'audio/ogg', flac: 'audio/flac'
-  };
-  const mimeType = mimeMap[ext] || 'audio/mpeg';
-
-  const formData = new FormData();
-  formData.append('file', audioBuffer, { filename: fileName, contentType: mimeType });
-  formData.append('model', 'whisper-large-v3');
-  formData.append('response_format', 'verbose_json');
-  formData.append('timestamp_granularities[]', 'word');
-  formData.append('timestamp_granularities[]', 'segment');
-
-  const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}`, ...formData.getHeaders() },
-    body: formData
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Whisper API error (${response.status}): ${errText}`);
-  }
-  return response.json();
-}
-
-// ── Main transcription entry point — handles any audio length ─────────
-
-export async function transcribeWithGroq(
+/**
+ * Transcribe an audio file using Gladia's async API.
+ * Handles audio of any length — Gladia processes the whole file server-side.
+ * Returns a Whisper-compatible response `{ words: [{word, start, end}] }` so
+ * the existing `extractWords` / `alignCsvToAudio` pipeline works unchanged.
+ */
+export async function transcribeWithGladia(
   audioFilePath: string,
   apiKey: string,
   onProgress?: (msg: string) => void
 ): Promise<any> {
   const { default: fsFull } = await import('fs');
-  const pathMod = await import('path');
-  const osMod   = await import('os');
+  const pathMod  = await import('path');
+  const osMod    = await import('os');
+  const FormData = (await import('form-data')).default;
+  const fetch    = (await import('node-fetch')).default;
 
   const log = (msg: string) => { console.log(msg); onProgress?.(msg); };
 
@@ -378,79 +382,105 @@ export async function transcribeWithGroq(
   const tempFiles: string[] = [];
 
   try {
-    // ── Step 1: Always compress to mono 64kbps MP3 ──────────────────
-    const compressedPath = pathMod.join(tmpDir, `snapsync_audio_${Date.now()}.mp3`);
+    // ── Step 1: Compress to mono MP3 for faster upload ───────────────
+    const compressedPath = pathMod.join(tmpDir, `snapsync_gladia_${Date.now()}.mp3`);
     tempFiles.push(compressedPath);
 
     const origSize = fsFull.statSync(audioFilePath).size;
-    log(`[whisper] Compressing audio (${(origSize / 1024 / 1024).toFixed(1)}MB) → mono 64kbps MP3...`);
+    log(`[gladia] Compressing audio (${(origSize / 1024 / 1024).toFixed(1)}MB) → mono 64kbps MP3...`);
     await compressAudio(audioFilePath, compressedPath);
     const compressedSize = fsFull.statSync(compressedPath).size;
-    log(`[whisper] Compressed to ${(compressedSize / 1024 / 1024).toFixed(1)}MB`);
+    log(`[gladia] Compressed to ${(compressedSize / 1024 / 1024).toFixed(1)}MB`);
 
-    // ── Step 2: Determine if chunking is needed ──────────────────────
-    const totalDuration = await getAudioDuration(compressedPath);
-    log(`[whisper] Audio duration: ${(totalDuration / 60).toFixed(1)} minutes`);
+    // ── Step 2: Upload to Gladia ─────────────────────────────────────
+    log(`[gladia] Uploading audio to Gladia...`);
+    const uploadForm = new FormData();
+    uploadForm.append('audio', fsFull.createReadStream(compressedPath), {
+      filename: 'audio.mp3',
+      contentType: 'audio/mpeg'
+    });
 
-    const needsChunking = totalDuration > CHUNK_DURATION_SEC || compressedSize > GROQ_MAX_BYTES;
-
-    if (!needsChunking) {
-      // ── Short audio: single request ────────────────────────────────
-      log(`[whisper] Transcribing in single request...`);
-      const buf = fsFull.readFileSync(compressedPath);
-      return await whisperRequest(buf, 'audio.mp3', apiKey);
+    const uploadRes = await fetch(GLADIA_UPLOAD_URL, {
+      method: 'POST',
+      headers: { 'x-gladia-key': apiKey, ...uploadForm.getHeaders() },
+      body: uploadForm
+    });
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      throw new Error(`Gladia upload failed (${uploadRes.status}): ${errText}`);
     }
+    const uploadData: any = await uploadRes.json();
+    const audioUrl: string = uploadData.audio_url;
+    if (!audioUrl) throw new Error('Gladia upload did not return audio_url');
+    log(`[gladia] Upload complete. audio_url: ${audioUrl}`);
 
-    // ── Step 3: Chunked transcription for long audio ─────────────────
-    const numChunks = Math.ceil(totalDuration / CHUNK_DURATION_SEC);
-    log(`[whisper] Long audio detected — splitting into ${numChunks} chunks of ${CHUNK_DURATION_SEC / 60} min each...`);
+    // ── Step 3: Start transcription job ─────────────────────────────
+    log(`[gladia] Starting transcription job...`);
+    const transcribeRes = await fetch(GLADIA_TRANSCRIBE_URL, {
+      method: 'POST',
+      headers: {
+        'x-gladia-key': apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        audio_url: audioUrl,
+        diarization: false,
+        word_timestamps: true
+      })
+    });
+    if (!transcribeRes.ok) {
+      const errText = await transcribeRes.text();
+      throw new Error(`Gladia transcription start failed (${transcribeRes.status}): ${errText}`);
+    }
+    const transcribeData: any = await transcribeRes.json();
+    const jobId: string = transcribeData.id;
+    if (!jobId) throw new Error('Gladia did not return a job id');
+    log(`[gladia] Job created: ${jobId}`);
 
-    const allWords: WhisperWord[] = [];
-    const seenWordKeys = new Set<string>(); // deduplicate overlap words
+    // ── Step 4: Poll for completion ──────────────────────────────────
+    const pollUrl = `${GLADIA_TRANSCRIBE_URL}/${jobId}`;
+    const deadline = Date.now() + GLADIA_MAX_WAIT_MS;
+    let gladiaResult: any = null;
 
-    for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-      const chunkStart = chunkIdx * CHUNK_DURATION_SEC;
-      // Add overlap at start (except first chunk) to catch boundary words
-      const sliceStart = Math.max(0, chunkStart - (chunkIdx > 0 ? CHUNK_OVERLAP_SEC : 0));
-      const sliceDur   = Math.min(CHUNK_DURATION_SEC + CHUNK_OVERLAP_SEC, totalDuration - sliceStart);
-
-      if (sliceDur <= 0) break;
-
-      const chunkPath = pathMod.join(tmpDir, `snapsync_chunk_${Date.now()}_${chunkIdx}.mp3`);
-      tempFiles.push(chunkPath);
-
-      log(`[whisper] Chunk ${chunkIdx + 1}/${numChunks}: ${(sliceStart / 60).toFixed(1)}–${((sliceStart + sliceDur) / 60).toFixed(1)} min`);
-      await sliceAudio(compressedPath, sliceStart, sliceDur, chunkPath);
-
-      const chunkBuf = fsFull.readFileSync(chunkPath);
-      const result   = await whisperRequest(chunkBuf, `chunk_${chunkIdx}.mp3`, apiKey);
-
-      // Extract words with absolute time offset applied
-      const chunkWords = extractWords(result, sliceStart);
-
-      // Deduplicate: skip words that fall in the overlap zone of previous chunk
-      const overlapCutoff = chunkIdx > 0 ? chunkStart : 0;
-      for (const w of chunkWords) {
-        if (w.start < overlapCutoff) continue; // belongs to previous chunk's territory
-        const key = `${w.text}:${w.start.toFixed(2)}`;
-        if (!seenWordKeys.has(key)) {
-          seenWordKeys.add(key);
-          allWords.push(w);
-        }
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, GLADIA_POLL_INTERVAL));
+      const pollRes = await fetch(pollUrl, {
+        headers: { 'x-gladia-key': apiKey }
+      });
+      if (!pollRes.ok) {
+        const errText = await pollRes.text();
+        throw new Error(`Gladia poll failed (${pollRes.status}): ${errText}`);
       }
+      const pollData: any = await pollRes.json();
+      log(`[gladia] Job status: ${pollData.status}`);
 
-      log(`[whisper] Chunk ${chunkIdx + 1} → ${chunkWords.length} words extracted`);
+      if (pollData.status === 'done') {
+        gladiaResult = pollData;
+        break;
+      }
+      if (pollData.status === 'error') {
+        throw new Error(`Gladia transcription error: ${JSON.stringify(pollData.error_code ?? pollData)}`);
+      }
     }
 
-    // Sort merged words by start time (chunks are sequential but overlaps may cause minor disorder)
-    allWords.sort((a, b) => a.start - b.start);
-    log(`[whisper] Total merged words: ${allWords.length}`);
+    if (!gladiaResult) {
+      throw new Error(`Gladia transcription timed out after ${GLADIA_MAX_WAIT_MS / 60000} minutes`);
+    }
 
-    // Return a synthetic whisper-style response with merged words
-    return { words: allWords.map(w => ({ word: w.text, start: w.start, end: w.end })), segments: [] };
+    // ── Step 5: Convert to Whisper-compatible word list ───────────────
+    const utterances: any[] = gladiaResult?.result?.transcription?.utterances ?? [];
+    const words: { word: string; start: number; end: number }[] = [];
+
+    for (const utt of utterances) {
+      for (const w of (utt.words ?? [])) {
+        if (w.word) words.push({ word: w.word, start: w.start ?? 0, end: w.end ?? 0 });
+      }
+    }
+    log(`[gladia] Extracted ${words.length} words from transcript`);
+
+    return { words, segments: [] };
 
   } finally {
-    // Clean up all temp files
     for (const f of tempFiles) {
       try { if (fsFull.existsSync(f)) fsFull.unlinkSync(f); } catch {}
     }

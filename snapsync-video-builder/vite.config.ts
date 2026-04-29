@@ -8,7 +8,7 @@ export default defineConfig(({mode}) => {
   return {
     plugins: [react(), tailwindcss()],
     define: {
-      'process.env.GROQ_API_KEY': JSON.stringify(env.GROQ_API_KEY),
+      'process.env.GLADIA_API_KEY': JSON.stringify(env.GLADIA_API_KEY),
     },
     resolve: {
       alias: {
