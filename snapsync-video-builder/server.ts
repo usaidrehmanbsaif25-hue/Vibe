@@ -182,9 +182,22 @@ app.post('/api/build', async (req, res) => {
     const concatFilePath = path.join(taskDir, 'concat.txt');
     let concatContent = '';
     
-    alignment.forEach((seg, idx) => {
-      // Use strictly sequential mapping
-      const imgPath = allImagesPaths[idx % allImagesPaths.length];
+    // Build a basename→path lookup for filename-based image matching (MP4 mode)
+    const imageByBasename: Record<string, string> = {};
+    for (const p of allImagesPaths) {
+      imageByBasename[path.basename(p).toLowerCase()] = p;
+    }
+
+    alignment.forEach((seg: any, idx: number) => {
+      // Resolve image: prefer filename from CSV second column, fall back to sequential wrap-around
+      let imgPath: string;
+      if (seg.imageFileName) {
+        imgPath =
+          imageByBasename[seg.imageFileName.toLowerCase()] ??
+          allImagesPaths[idx % allImagesPaths.length];
+      } else {
+        imgPath = allImagesPaths[idx % allImagesPaths.length];
+      }
       if (fs.existsSync(imgPath)) {
         // FFmpeg concat demuxer expects single quotes escaped and forward slashes on Windows
         const escapedPath = imgPath.replace(/\\/g, '/').replace(/'/g, "'\\''");

@@ -297,18 +297,31 @@ export function generateCapCutProject(
     vocal_separations: []
   };
 
-  // ── Build video segments (one per image) ──
+  // ── Build video segments (one per alignment entry) ──
   const videoSegments: any[] = [];
-  const n = Math.min(alignment.length, copiedImagePaths.length);
 
-  for (let i = 0; i < n; i++) {
+  // Build a basename→path lookup for filename-based image matching
+  const imageByBasename = new Map<string, string>();
+  for (const p of copiedImagePaths) {
+    imageByBasename.set(path.basename(p).toLowerCase(), p);
+  }
+
+  for (let i = 0; i < alignment.length; i++) {
     const seg = alignment[i];
     const startMicro = secToMicro(seg.startTime);
     const endMicro = secToMicro(seg.endTime);
     const durMicro = endMicro - startMicro;
     if (durMicro <= 0) continue;
 
-    const imgPath = copiedImagePaths[i];
+    // Resolve image: prefer filename from CSV, fall back to sequential (with wrap-around)
+    let imgPath: string;
+    if (seg.imageFileName) {
+      imgPath =
+        imageByBasename.get(seg.imageFileName.toLowerCase()) ??
+        copiedImagePaths[i % copiedImagePaths.length];
+    } else {
+      imgPath = copiedImagePaths[i % copiedImagePaths.length];
+    }
     const videoMatId = ccUUID();
     const speedId = ccUUID();
     const canvasId = ccUUID();

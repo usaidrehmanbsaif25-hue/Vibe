@@ -15,15 +15,17 @@ export interface WhisperWord {
 
 export interface CsvRow {
   index: number;
-  text: string;       // original text
-  cleanText: string;  // normalized
-  tokens: string[];   // normalized tokens
+  text: string;           // original text
+  cleanText: string;      // normalized
+  tokens: string[];       // normalized tokens
+  imageFileName?: string; // optional second CSV column (image filename)
 }
 
 export interface AlignedSegment {
   text: string;
   startTime: number;
   endTime: number;
+  imageFileName?: string; // forwarded from CSV second column
 }
 
 // ── Text normalization (matches notebook logic) ──────────────────────
@@ -75,7 +77,7 @@ function findSentenceMatch(
   sentenceTokens: string[],
   words: WhisperWord[],
   startWordIndex: number,
-  lookaheadWords: number = 600
+  lookaheadWords: number = 1000
 ): { startIdx: number; endIdx: number; score: number } | null {
   if (!sentenceTokens.length) return null;
 
@@ -125,15 +127,53 @@ function findSentenceMatch(
 
 // ── Parse CSV text into rows ─────────────────────────────────────────
 
+/**
+ * Parse a single CSV value: strip surrounding quotes and unescape doubled quotes.
+ */
+function parseCsvField(raw: string): string {
+  const s = raw.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1).replace(/""/g, '"').trim();
+  }
+  return s;
+}
+
+/**
+ * Split a CSV line into at most two fields, respecting quoted values.
+ * Returns [textField, imageField | undefined].
+ */
+function splitCsvLine(line: string): [string, string | undefined] {
+  // Walk through the line tracking whether we are inside a quoted field
+  let inQuote = false;
+  let quoteChar = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (!inQuote && (ch === '"' || ch === "'")) {
+      inQuote = true;
+      quoteChar = ch;
+    } else if (inQuote && ch === quoteChar) {
+      // Handle escaped double-quote ("") – stay inside the field
+      if (line[i + 1] === quoteChar) { i++; continue; }
+      inQuote = false;
+    } else if (!inQuote && ch === ',') {
+      // Found the field separator
+      const textRaw  = line.substring(0, i);
+      const imageRaw = line.substring(i + 1);
+      const imageVal = parseCsvField(imageRaw);
+      return [parseCsvField(textRaw), imageVal || undefined];
+    }
+  }
+  // No comma found – single-column CSV
+  return [parseCsvField(line), undefined];
+}
+
 export function parseCsvText(csvText: string): CsvRow[] {
   const lines = csvText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const rows: CsvRow[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    let text = lines[i];
-    const commaIdx = text.indexOf(',');
-    if (commaIdx >= 0) text = text.substring(0, commaIdx);
-    text = text.replace(/^["']|["']$/g, '').trim();
+    const [textRaw, imageFileName] = splitCsvLine(lines[i]);
+    const text = textRaw.trim();
 
     const lower = text.toLowerCase();
     if (i === 0 && (lower === 'text' || lower === 'script' || lower === 'line' ||
@@ -144,7 +184,7 @@ export function parseCsvText(csvText: string): CsvRow[] {
     const clean = normalizeText(text);
     if (!clean) continue;
 
-    rows.push({ index: rows.length, text, cleanText: clean, tokens: clean.split(' ') });
+    rows.push({ index: rows.length, text, cleanText: clean, tokens: clean.split(' '), imageFileName });
   }
   return rows;
 }
@@ -266,7 +306,8 @@ export function alignCsvToAudio(
     result.push({
       text: csvRows[i].text,
       startTime: Math.round(t[0] * 1000) / 1000,
-      endTime:   Math.round(endTime * 1000) / 1000
+      endTime:   Math.round(endTime * 1000) / 1000,
+      imageFileName: csvRows[i].imageFileName
     });
   }
 
@@ -428,10 +469,17 @@ export async function transcribeWithGroq(
       // Extract words with absolute time offset applied
       const chunkWords = extractWords(result, sliceStart);
 
-      // Deduplicate: skip words that fall in the overlap zone of previous chunk
-      const overlapCutoff = chunkIdx > 0 ? chunkStart : 0;
+      // Deduplicate: each chunk only owns words in [chunkStart, nextChunkStart).
+      // The backward overlap (sliceStart … chunkStart) gives Whisper better context
+      // for boundary words but those words belong to the previous chunk's territory.
+      // The forward overlap (chunkStart … sliceStart+sliceDur) is extra audio included
+      // so Whisper has context; those words belong to the NEXT chunk's territory and
+      // must be excluded here to prevent double-counting.
+      const lowerCutoff = chunkIdx > 0 ? chunkStart : 0;
+      const upperCutoff = chunkIdx < numChunks - 1 ? (chunkIdx + 1) * CHUNK_DURATION_SEC : Infinity;
       for (const w of chunkWords) {
-        if (w.start < overlapCutoff) continue; // belongs to previous chunk's territory
+        if (w.start < lowerCutoff) continue; // belongs to previous chunk's territory
+        if (w.start >= upperCutoff) continue; // belongs to next chunk's territory
         const key = `${w.text}:${w.start.toFixed(2)}`;
         if (!seenWordKeys.has(key)) {
           seenWordKeys.add(key);
